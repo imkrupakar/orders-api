@@ -1,0 +1,153 @@
+# Build-ONCE, tag with SemVer (GitVersion) + digest, push to the SBX CLUSTER's ACR, then pin SBX.
+# main        -> prerelease X.Y.Z-alpha.N  -> SBX (integration ring)
+# releases/M# -> stable X.Y.Z + git tag vX.Y.Z (immutable, cosign-signed) -> SBX, then promote
+#               (`M<digits>` is the branch shape GitVersion.yml recognises; other names do not build)
+# Per-cluster ACR topology: CI discovers the sbx cluster's registry from the sbx leaf's
+# `image.repository` (single source of truth) and pushes there. Promotion (the GitOps promote
+# workflow) copies the exact digest into each higher cluster's own ACR.
+# AWS: the AWS clusters get the image through their own per-cluster CI/promotion path (follow-up);
+# this Azure-first iteration does not copy to ECR.
+# CI only writes the sbx CLUSTER LEAF (apps/<svc>/envs/<env>/<cloud>/<region>/values.yaml) in the
+# team GitOps repo. This repo is cloud/region-agnostic: one image runs on every cluster.
+name: cd
+on:
+  push:
+    branches: [main, "releases/M[0-9]*"]
+env:
+  SERVICE: orders-api
+  GITOPS_REPO: imkrupakar/team-alpha-gitops
+  SBX_CLUSTER: sbx/azure/centralus # <env>/<cloud>/<region> leaf that CI pins (and whose ACR it pushes to)
+permissions:
+  contents: write # push git tag
+  id-token: write # OIDC to Azure (sbx ACR) + cosign keyless
+# One run at a time per branch, never cancelled mid-flight: a half-finished release (tag pushed, image built,
+# sbx not yet pinned) must be allowed to finish. A newer push waits its turn (GitHub keeps only the newest
+# waiter), so an older build can no longer finish last and overwrite a newer sbx pin.
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # GitVersion needs full history + tags
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v3.0.0
+        with:
+          versionSpec: "6.0.x"
+
+      - name: GitVersion
+        id: gv
+        uses: gittools/actions/gitversion/execute@v3.0.0
+        with:
+          configFilePath: GitVersion.yml
+
+      - name: Resolve version + release flag
+        id: ver
+        run: |
+          VER="${{ steps.gv.outputs.semVer }}"
+          [ -n "$VER" ] || { echo "::error::empty version"; exit 1; }
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          case "${GITHUB_REF}" in
+            refs/heads/releases/M[0-9]*) echo "stable=true"  >> "$GITHUB_OUTPUT" ;;
+            *)                     echo "stable=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Push git tag (stable releases only)
+        if: steps.ver.outputs.stable == 'true'
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git rev-parse "$TAG" >/dev/null 2>&1 || { git tag -a "$TAG" -m "$TAG"; git push origin "$TAG"; }
+
+      - name: Azure login (OIDC, CI publisher)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Discover sbx cluster registry from the leaf
+        id: reg
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          # Per-cluster ACR: the sbx leaf's image.repository is the single source of truth for where
+          # CI pushes. Read it (shallow clone), derive the ACR login server + name.
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITOPS_REPO}.git" gitops
+          F="gitops/apps/${SERVICE}/envs/${SBX_CLUSTER}/values.yaml"
+          [ -f "$F" ] || { echo "::error::$F does not exist: create the sbx leaf (image.repository + goldenChart) in ${GITOPS_REPO} first"; exit 1; }
+          IMAGE_REPO="$(yq -r '.image.repository' "$F")"
+          [ -n "$IMAGE_REPO" ] && [ "$IMAGE_REPO" != "null" ] || { echo "::error::image.repository missing in $F"; exit 1; }
+          LOGIN_SERVER="${IMAGE_REPO%%/*}"          # acrxxxx.azurecr.io
+          ACR_NAME="${LOGIN_SERVER%%.*}"            # acrxxxx
+          echo "image_repo=$IMAGE_REPO"     >> "$GITHUB_OUTPUT"
+          echo "login_server=$LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+          echo "acr_name=$ACR_NAME"         >> "$GITHUB_OUTPUT"
+          echo "Discovered sbx registry: $IMAGE_REPO (ACR $ACR_NAME)"
+
+      - name: ACR login
+        run: az acr login --name "${{ steps.reg.outputs.acr_name }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build once + push (SemVer + sha tags, SBOM + provenance)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ${{ steps.reg.outputs.image_repo }}:${{ steps.ver.outputs.version }}
+            ${{ steps.reg.outputs.image_repo }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Sign image (cosign keyless)
+        env:
+          IMAGE_REPO: ${{ steps.reg.outputs.image_repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign version >/dev/null 2>&1 || { curl -sSLo /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign; }
+          cosign sign --yes "${IMAGE_REPO}@${DIGEST}"
+
+      - name: Lock stable image (immutable)
+        if: steps.ver.outputs.stable == 'true'
+        run: |
+          az acr repository update \
+            --name "${{ steps.reg.outputs.acr_name }}" \
+            --image "${SERVICE}:${{ steps.ver.outputs.version }}" \
+            --write-enabled false --delete-enabled false
+
+      - name: Pin SBX to this build (tag + digest)
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          # Reuse the shallow clone from the discovery step; make sure it can fetch/reset main.
+          cd gitops
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITOPS_REPO}.git"
+          F="apps/${SERVICE}/envs/${SBX_CLUSTER}/values.yaml"
+          [ -f "$F" ] || { echo "::error::$F does not exist: create the sbx leaf (route.host + goldenChart) in ${GITOPS_REPO} first"; exit 1; }
+          # Another build (or a promotion PR) may push first. Instead of merging, re-apply the two values on top of
+          # the fresh main, so the result is always "this build's pin on the latest main".
+          for attempt in 1 2 3 4 5; do
+            yq -i ".image.tag = \"${VERSION}\" | .image.digest = \"${DIGEST}\"" "$F"
+            if git diff --quiet; then echo "sbx leaf already pinned to ${VERSION} (${DIGEST}); nothing to do"; exit 0; fi
+            git commit -qam "chore(${SERVICE}): sbx ${VERSION} (${DIGEST})"
+            if git push origin HEAD:main; then exit 0; fi
+            echo "push rejected (attempt ${attempt}/5): refetching main and retrying"
+            git fetch -q --depth 1 origin main && git reset -q --hard origin/main
+          done
+          echo "::error::could not push the sbx pin after 5 attempts"; exit 1

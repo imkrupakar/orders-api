@@ -1,0 +1,71 @@
+# Checks on every PR and on main. Four independent jobs so each shows as its own check:
+#   build-test        go vet + go build
+#   secret-scan       gitleaks over the full git history
+#   dependency-scan   govulncheck (Go modules + stdlib, reachability-aware)
+#   image-scan        Trivy on the image built from the Dockerfile (HIGH/CRITICAL gate) + Dockerfile misconfig
+# Scanners run from official container images pinned by DIGEST (no third-party action code runs
+# with the workflow token, and gitleaks-action's org licence key is not needed). Bump the
+# version tag and digest together. cd.yml does NOT wait for this workflow; to make these gates
+# binding, mark the jobs as required checks in branch protection.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # single source of truth for the Go version
+      - run: go vet ./...
+      - run: go build -o /dev/null ./... # -o /dev/null: compile-check only; avoids the binary name colliding with the src/ dir
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan every commit, not just the tip
+      - name: gitleaks (full history)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git --verbose --redact --exit-code 1 /repo
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
+
+  image-scan:
+    runs-on: ubuntu-latest
+    env:
+      TRIVY: ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (not pushed)
+        run: |
+          docker build -t orders-api:ci .
+          docker save -o "$RUNNER_TEMP/image.tar" orders-api:ci
+      # The repo is mounted as the working dir so a reviewed .trivyignore at the repo root is honoured.
+      - name: Trivy image scan (HIGH/CRITICAL fails the build)
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work -v "$RUNNER_TEMP:/img:ro" "$TRIVY" image \
+            --input /img/image.tar \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress
+      - name: Trivy Dockerfile misconfiguration scan
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work "$TRIVY" config \
+            --severity HIGH,CRITICAL --exit-code 1 .

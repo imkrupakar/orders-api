@@ -1,0 +1,21 @@
+mode: ContinuousDeployment
+tag-prefix: '[vV]'
+branches:
+  main:
+    regex: ^main$
+    increment: Minor
+    label: alpha
+    source-branches: []
+  release:
+    regex: ^releases?/M\d+$
+    increment: Patch
+    label: ''
+    is-release-branch: true
+    source-branches: ['main']
+  feature:
+    regex: ^features?[/-]
+    increment: Inherit
+    label: alpha
+    source-branches: ['main']
+ignore:
+  sha: []
